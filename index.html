@@ -1,69 +1,247 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>猫が逃げるゲーム</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            width: 100vw;
-            height: 100vh;
-            overflow: hidden; /* スクロールバーが出ないようにする */
-            background-color: #f0f0f0;
-            font-family: sans-serif;
-        }
-
-        #game-target {
-            position: absolute;
-            cursor: pointer;
-            transition: all 0.1s ease-out; /* 少し動きを滑らかにする（お好みで） */
-            user-select: none;
-            -webkit-user-drag: none;
-        }
-
-        .info {
-            padding: 10px;
-            color: #333;
-        }
-    </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>お魚をくわえた猫が逃げるゲーム</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #d9d9d9; /* 明るい灰色 */
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      user-select: none;
+    }
+    #stage {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    .sprite {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 120px;
+      height: 120px;
+      object-fit: contain;
+      transform: translate(-50%, -50%); /* x,y を中心座標にする */
+      -webkit-user-drag: none;
+      user-drag: none;
+      pointer-events: auto;
+    }
+    #cat, #human {
+      cursor: pointer; /* 両方クリックできる */
+    }
+    #hint {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.7);
+      border-radius: 8px;
+      font-size: 14px;
+    }
+  </style>
 </head>
 <body>
+  <div id="stage">
+    <div id="hint">🐱 or 👤 をクリック → 👤が追いかける → 追いつくと🐱がスライドで逃げる</div>
+    <img id="human" class="sprite" src="human.png" alt="人間" draggable="false" />
+    <img id="cat" class="sprite" src="cat.png" alt="猫" draggable="false" />
+  </div>
 
-    <div class="info">画像をクリックしてね！</div>
-    
-    <img id="game-target" src="your-image.png" alt="ターゲット" width="100">
+  <script>
+    // ===== 設定 =====
+    const IMG_SIZE = 120;
+    const MARGIN = 16;
+    const MIN_INITIAL_DISTANCE = 260;
+    const MIN_ESCAPE_DISTANCE  = 180;
 
-    <script>
-        const target = document.getElementById('game-target');
+    const HUMAN_SPEED = 420; // px/秒
+    const CAT_SPEED   = 1520; // px/秒（猫を少し速くする例。不要なら人間と同じに）
+    const ARRIVAL_EPS = 4;
 
-        // 画像をランダムな位置に移動させる関数
-        function moveImage() {
-            // 画面の幅と高さから、画像のサイズ分を引いて範囲を決める
-            const maxX = window.innerWidth - target.clientWidth;
-            const maxY = window.innerHeight - target.clientHeight;
+    // ===== DOM =====
+    const humanEl = document.getElementById("human");
+    const catEl   = document.getElementById("cat");
 
-            // ランダムな座標を計算
-            const randomX = Math.floor(Math.random() * maxX);
-            const randomY = Math.floor(Math.random() * maxY);
+    // ===== 状態 =====
+    const state = {
+      human: { x: 0, y: 0 },
+      cat:   { x: 0, y: 0 },
+      movingHuman: false,
+      movingCat: false,
+      rafHuman: null,
+      rafCat: null,
+    };
 
-            // スタイルに反映
-            target.style.left = randomX + 'px';
-            target.style.top = randomY + 'px';
-        }
+    // ===== utils =====
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
-        // クリックした時のイベント
-        target.addEventListener('click', () => {
-            moveImage();
+    function stageBounds() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const half = IMG_SIZE / 2;
+      return {
+        minX: half + MARGIN,
+        maxX: w - half - MARGIN,
+        minY: half + MARGIN,
+        maxY: h - half - MARGIN,
+      };
+    }
+
+    function dist(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    function setSpritePos(el, pos) {
+      el.style.left = `${pos.x}px`;
+      el.style.top  = `${pos.y}px`;
+    }
+
+    function randomPos() {
+      const b = stageBounds();
+      return {
+        x: Math.random() * (b.maxX - b.minX) + b.minX,
+        y: Math.random() * (b.maxY - b.minY) + b.minY,
+      };
+    }
+
+    function randomPosFarFrom(fromPos, minDistance, maxTries = 300) {
+      let p = randomPos();
+      let tries = 0;
+      while (dist(p, fromPos) < minDistance && tries < maxTries) {
+        p = randomPos();
+        tries++;
+      }
+      return p;
+    }
+
+    // ===== 汎用スライド移動 =====
+    function slideMove({
+      getPos, setPos, setDom, target, speed,
+      isMovingFlagGetter, isMovingFlagSetter,
+      rafIdGetter, rafIdSetter,
+      onArrive
+    }) {
+      if (isMovingFlagGetter()) return;
+
+      const start = { ...getPos() };
+      const dx = target.x - start.x;
+      const dy = target.y - start.y;
+      const distance = Math.hypot(dx, dy);
+
+      if (distance < ARRIVAL_EPS) {
+        setPos({ ...target });
+        setDom();
+        isMovingFlagSetter(false);
+        onArrive?.();
+        return;
+      }
+
+      isMovingFlagSetter(true);
+      const duration = distance / speed; // 秒
+      const t0 = performance.now();
+
+      function tick(now) {
+        const t = (now - t0) / 1000;
+        const alpha = clamp(t / duration, 0, 1);
+
+        setPos({
+          x: start.x + dx * alpha,
+          y: start.y + dy * alpha
         });
+        setDom();
 
-        // 画像が読み込まれた直後に最初の配置を行う
-        window.onload = moveImage;
+        if (alpha >= 1) {
+          isMovingFlagSetter(false);
+          rafIdSetter(null);
+          onArrive?.();
+          return;
+        }
+        rafIdSetter(requestAnimationFrame(tick));
+      }
 
-        // 画面サイズが変わった時も、はみ出さないように調整
-        window.onresize = moveImage;
-    </script>
+      rafIdSetter(requestAnimationFrame(tick));
+    }
+
+    function moveHumanTo(target, onArrive) {
+      slideMove({
+        getPos: () => state.human,
+        setPos: (p) => state.human = p,
+        setDom: () => setSpritePos(humanEl, state.human),
+        target,
+        speed: HUMAN_SPEED,
+        isMovingFlagGetter: () => state.movingHuman,
+        isMovingFlagSetter: (v) => state.movingHuman = v,
+        rafIdGetter: () => state.rafHuman,
+        rafIdSetter: (id) => state.rafHuman = id,
+        onArrive
+      });
+    }
+
+    function moveCatTo(target, onArrive) {
+      slideMove({
+        getPos: () => state.cat,
+        setPos: (p) => state.cat = p,
+        setDom: () => setSpritePos(catEl, state.cat),
+        target,
+        speed: CAT_SPEED,
+        isMovingFlagGetter: () => state.movingCat,
+        isMovingFlagSetter: (v) => state.movingCat = v,
+        rafIdGetter: () => state.rafCat,
+        rafIdSetter: (id) => state.rafCat = id,
+        onArrive
+      });
+    }
+
+    // ===== 初期配置 =====
+    function initPositions() {
+      state.human = randomPos();
+      state.cat = randomPosFarFrom(state.human, MIN_INITIAL_DISTANCE);
+      setSpritePos(humanEl, state.human);
+      setSpritePos(catEl, state.cat);
+    }
+
+    // ===== 猫が逃げる（スライド） =====
+    function catEscapesSlide() {
+      // 猫が移動中に、人間が再クリックされても挙動がややこしいので
+      // 「猫が逃げてる間はクリック無効」にしている（必要なら変更可）
+      const target = randomPosFarFrom(state.human, MIN_ESCAPE_DISTANCE);
+      moveCatTo(target);
+    }
+
+    // ===== 追いかけ開始（猫クリックでも人間クリックでも同じ） =====
+    function startChase() {
+      // どちらか動いていたら無視
+      if (state.movingHuman || state.movingCat) return;
+
+      const target = { ...state.cat };
+      moveHumanTo(target, () => {
+        // 人間が猫に到着したら、猫が逃げる（スライド）
+        catEscapesSlide();
+      });
+    }
+
+    // クリックイベント：猫でも人間でも同じ
+    catEl.addEventListener("click", startChase);
+    humanEl.addEventListener("click", startChase);
+
+    // リサイズで画面外に出ないよう補正
+    window.addEventListener("resize", () => {
+      const b = stageBounds();
+      state.human.x = clamp(state.human.x, b.minX, b.maxX);
+      state.human.y = clamp(state.human.y, b.minY, b.maxY);
+      state.cat.x   = clamp(state.cat.x,   b.minX, b.maxX);
+      state.cat.y   = clamp(state.cat.y,   b.minY, b.maxY);
+      setSpritePos(humanEl, state.human);
+      setSpritePos(catEl, state.cat);
+    });
+
+    initPositions();
+  </script>
 </body>
 </html>
-
